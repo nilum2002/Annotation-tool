@@ -87,6 +87,12 @@ except ImportError:
     cv2 = None
 
 
+def stamp_ns(header):
+    """A message's own capture time. Falls back to nothing if unset."""
+    ns = header.stamp.sec * 10 ** 9 + header.stamp.nanosec
+    return ns if ns > 0 else None
+
+
 def yaw_of(q):
     return math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y ** 2 + q.z ** 2))
 
@@ -155,7 +161,8 @@ class Bag(object):
         reader = open_bag(path)
         reader.set_filter(rosbag2_py.StorageFilter(topics=wanted))
 
-        self.scan_t, ranges, angles = [], [], []
+        self.scan_t, self.sweep_ns, ranges, angles = [], [], [], []
+        self.unstamped = 0
         self.odom_t, odom_xy, odom_yaw = [], [], []
         self.img_t, self.img_jpg = [], []
         self.proto = None
@@ -177,7 +184,15 @@ class Bag(object):
                 r = np.asarray(m.ranges, dtype=np.float64)
                 r[~np.isfinite(r)] = np.nan
                 r[(r < m.range_min) | (r > m.range_max)] = np.nan
-                self.scan_t.append(ts)
+                # Header stamp, not the bag receive time. The two differ by a
+                # full sweep here, because the driver stamps the first ray and
+                # publishes once the revolution finishes.
+                t = stamp_ns(m.header)
+                if t is None:
+                    t, self.unstamped = ts, self.unstamped + 1
+                self.scan_t.append(t)
+                sweep = m.scan_time or (len(r) * m.time_increment)
+                self.sweep_ns.append(int(sweep * 1e9))
                 ranges.append(r)
                 # Per ROS semantics the i-th beam is at angle_min + i*increment.
                 # Do not derive it from angle_max, which drifts scan to scan.
@@ -188,16 +203,16 @@ class Bag(object):
                 self.odom_frame = self.odom_frame or m.header.frame_id
                 self.base_frame = self.base_frame or m.child_frame_id
                 p = m.pose.pose.position
-                self.odom_t.append(ts)
+                self.odom_t.append(stamp_ns(m.header) or ts)
                 odom_xy.append((p.x, p.y))
                 odom_yaw.append(yaw_of(m.pose.pose.orientation))
             elif topic == self.image_topic:
                 if len(self.img_jpg) >= max_images:
                     dropped_images += 1
                     continue
-                jpg = self._to_jpg(data, types[self.image_topic])
+                jpg, hdr = self._to_jpg(data, types[self.image_topic])
                 if jpg is not None:
-                    self.img_t.append(ts)
+                    self.img_t.append(hdr or ts)
                     self.img_jpg.append(jpg)
             elif topic == "/tf_static":
                 static.extend(deserialize_message(data, TFMessage).transforms)
@@ -213,6 +228,10 @@ class Bag(object):
         self.beam_counts = (min(len(r) for r in ranges), max(len(r) for r in ranges))
         self.scan_t = np.asarray(self.scan_t, dtype=np.int64)
         self.img_t = np.asarray(self.img_t, dtype=np.int64)
+        # A spinning lidar measures across the whole revolution, so the instant
+        # that best represents a scan is its middle, not its first ray. This is
+        # what the camera frame should be matched against.
+        self.scan_mid = self.scan_t + np.asarray(self.sweep_ns, np.int64) // 2
         self.range_max = RANGE_CUTOFF or self.proto.range_max
 
         self.laser_to_base = self._chain(static, self.proto.header.frame_id, self.base_frame)
@@ -223,10 +242,12 @@ class Bag(object):
                   .format(len(self.img_jpg), dropped_images))
 
     def _to_jpg(self, data, msgtype):
+        """(jpeg bytes, capture time) for one image message."""
         if msgtype.endswith("CompressedImage"):
-            return bytes(deserialize_message(data, CompressedImage).data)
+            m = deserialize_message(data, CompressedImage)
+            return bytes(m.data), stamp_ns(m.header)
         if cv2 is None:
-            return None
+            return None, None
         m = deserialize_message(data, Image)
         buf = np.frombuffer(m.data, np.uint8)
         if m.encoding in ("rgb8", "bgr8"):
@@ -236,9 +257,9 @@ class Bag(object):
         elif m.encoding in ("mono8", "8UC1"):
             img = buf.reshape(m.height, m.step)[:, :m.width]
         else:
-            return None
+            return None, None
         ok, enc = cv2.imencode(".jpg", img)
-        return bytes(enc) if ok else None
+        return (bytes(enc) if ok else None), stamp_ns(m.header)
 
     def _chain(self, static, src, dst):
         """Compose the static transforms leading from `src` up to `dst`."""
@@ -290,11 +311,11 @@ class Bag(object):
         """(rgb, seconds_off) for the frame nearest scan i, or (None, None)."""
         if not len(self.img_t) or cv2 is None:
             return None, None
-        j = int(np.abs(self.img_t - self.scan_t[i]).argmin())
+        j = int(np.abs(self.img_t - self.scan_mid[i]).argmin())
         img = cv2.imdecode(np.frombuffer(self.img_jpg[j], np.uint8), cv2.IMREAD_COLOR)
         if img is None:
             return None, None
-        return img[:, :, ::-1], (self.img_t[j] - self.scan_t[i]) / 1e9
+        return img[:, :, ::-1], (self.img_t[j] - self.scan_mid[i]) / 1e9
 
 
 class MouseCircle(AxesWidget):
@@ -725,6 +746,15 @@ def main():
     p.add_argument("--robot-yaw", type=float, default=None,
                    help="Rotate the robot marker off the odometry yaw, in "
                         "degrees. The wedge follows it. 180 mirrors both.")
+    p.add_argument("--tickskip", type=int, default=None,
+                   help="Annotate every Nth scan. 1 annotates every scan. "
+                        "Lowering it keeps work already done, since "
+                        "annotations are keyed by scan index.")
+    p.add_argument("--batchsize", type=int, default=None,
+                   help="How many scans one batch spans.")
+    p.add_argument("--batchskip", type=int, default=None,
+                   help="Batches to skip after each annotated one. 0 covers "
+                        "the whole bag.")
     p.add_argument("--max-images", type=int, default=4000,
                    help="Cap on frames held in memory.")
     args = p.parse_args()
@@ -740,6 +770,13 @@ def main():
         globals()["CAMERA_YAW_DEG"] = args.camera_yaw
     if args.robot_yaw is not None:
         globals()["ROBOT_YAW_DEG"] = args.robot_yaw
+    for flag, name in (("tickskip", "TICKSKIP"), ("batchsize", "BATCHSIZE"),
+                       ("batchskip", "BATCHSKIP")):
+        v = getattr(args, flag)
+        if v is not None:
+            if name != "BATCHSKIP" and v < 1:
+                sys.exit("--{} must be at least 1.".format(flag))
+            globals()[name] = v
     lo, hi = bag.beam_counts
     beams = "{} beams".format(lo) if lo == hi else "{}-{} beams".format(lo, hi)
     print("{} scans of {}, {} camera frames, odometry: {}".format(
