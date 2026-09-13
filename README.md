@@ -1,14 +1,21 @@
-# laser-detection-annotator
-A tool to annotate/label detections in a stream of laser data. Can show supporting video if available.
+# laser-detection-annotator for multi object(human) id with ros2 bags.
+A tool to annotate/label detections in a stream of laser data.
 
-[![Screenshot of the annotator](screenshot.png)](screenshot.png)
+I extended the exisiting tool of [laser-detection-annotator](https://github.com/lucasb-eyer/laser-detection-annotator)for multi human annotation to collect a dataset for my project : [link](https://github.com/nilum2002/proactive-social-nav/).
 
-**TODO**: Documentation both of usage and of customization!
 
-Usage:
+[![Screenshot of the annotator](image.png)](image.png)
+
+
+
+Run:
 
 ```
-python anno1602.py [--dry-run] subpath-basename
+python3 anno_ros2.py <rosbag.mcap> --range 3 # range : sets the zoom
 ```
 
-Have a look at the code, all configuration parameters are at the beginning and commented.
+Export annotations for csv:
+
+```
+python3 export_tracks.py annotations.json
+```
