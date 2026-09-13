@@ -41,6 +41,20 @@ RANGE_CUTOFF = None
 # moving robot some context. 0 draws only the current scan.
 CONTEXT_SCANS = 6
 
+# Which way the robot marker points, as an offset on the odometry yaw. This
+# only rotates the drawn arrow, never the scan data, so use it when the arrow
+# disagrees with how the robot is actually built. 180 turns it around.
+ROBOT_YAW_DEG = 180.0
+
+# Horizontal field of view of the supporting camera, drawn as two dotted lines
+# from the robot so you can see which laser returns the video can corroborate.
+# None hides it. CAMERA_YAW_DEG is measured from the robot marker above, so the
+# wedge follows it, and stays 0 for a camera that looks straight ahead. The
+# apex sits at the robot origin rather than at the camera itself, because bags
+# here carry no static transform for the camera frame.
+CAMERA_FOV_DEG = 110.0
+CAMERA_YAW_DEG = 0.0
+
 # How a person is drawn. One click, one person.
 MARKER, COLOUR, IGNORE_COLOUR = "o", "#50B948", "#B0752A"
 
@@ -141,7 +155,7 @@ class Bag(object):
         reader = open_bag(path)
         reader.set_filter(rosbag2_py.StorageFilter(topics=wanted))
 
-        self.scan_t, ranges = [], []
+        self.scan_t, ranges, angles = [], [], []
         self.odom_t, odom_xy, odom_yaw = [], [], []
         self.img_t, self.img_jpg = [], []
         self.proto = None
@@ -149,8 +163,14 @@ class Bag(object):
         static = []
         dropped_images = 0
 
+        nread = 0
         while reader.has_next():
             topic, data, ts = reader.read_next()
+            nread += 1
+            if nread % 2000 == 0:
+                print("  ... {} messages, {} scans, {} frames"
+                      .format(nread, len(ranges), len(self.img_jpg)))
+                sys.stdout.flush()
             if topic == self.scan_topic:
                 m = deserialize_message(data, LaserScan)
                 self.proto = self.proto or m
@@ -159,6 +179,10 @@ class Bag(object):
                 r[(r < m.range_min) | (r > m.range_max)] = np.nan
                 self.scan_t.append(ts)
                 ranges.append(r)
+                # Per ROS semantics the i-th beam is at angle_min + i*increment.
+                # Do not derive it from angle_max, which drifts scan to scan.
+                angles.append(m.angle_min
+                              + np.arange(len(r)) * m.angle_increment)
             elif topic == self.odom_topic:
                 m = deserialize_message(data, Odometry)
                 self.odom_frame = self.odom_frame or m.header.frame_id
@@ -180,14 +204,15 @@ class Bag(object):
 
         if not ranges:
             sys.exit("No messages on {}.".format(self.scan_topic))
-        if len({len(r) for r in ranges}) != 1:
-            sys.exit("Scans vary in length, which this tool does not handle.")
 
-        self.ranges = np.asarray(ranges)
+        # Kept as lists, not one 2-D array. A spinning lidar samples whatever
+        # its motor speed allows, so beam count and angular step both vary from
+        # revolution to revolution and no rectangular array fits.
+        self.ranges = ranges
+        self.angles = angles
+        self.beam_counts = (min(len(r) for r in ranges), max(len(r) for r in ranges))
         self.scan_t = np.asarray(self.scan_t, dtype=np.int64)
         self.img_t = np.asarray(self.img_t, dtype=np.int64)
-        self.angles = (self.proto.angle_min
-                       + np.arange(self.ranges.shape[1]) * self.proto.angle_increment)
         self.range_max = RANGE_CUTOFF or self.proto.range_max
 
         self.laser_to_base = self._chain(static, self.proto.header.frame_id, self.base_frame)
@@ -251,7 +276,8 @@ class Bag(object):
         """Scan i as x,y. In the base frame by default, else raw laser frame."""
         r = self.ranges[i].copy()
         r[r > self.range_max] = np.nan
-        x, y = r * np.cos(self.angles), r * np.sin(self.angles)
+        a = self.angles[i]
+        x, y = r * np.cos(a), r * np.sin(a)
         return self.laser_to_base.apply(x, y) if base_frame else (x, y)
 
     def laser_to_odom(self, i):
@@ -528,9 +554,18 @@ class Annotator(object):
 
         # The robot, and where its nose points.
         pose = self.bag.poses[si] if self.world else SE2()
+        heading = pose.theta + math.radians(ROBOT_YAW_DEG)
         self.ax.plot([pose.x], [pose.y], marker="s", ms=6, color="k")
-        self.ax.arrow(pose.x, pose.y, 0.6 * math.cos(pose.theta), 0.6 * math.sin(pose.theta),
+        self.ax.arrow(pose.x, pose.y, 0.6 * math.cos(heading), 0.6 * math.sin(heading),
                       head_width=0.18, color="k", length_includes_head=True)
+
+        if CAMERA_FOV_DEG:
+            half = math.radians(CAMERA_FOV_DEG) / 2.0
+            axis = heading + math.radians(CAMERA_YAW_DEG)
+            for edge in (axis - half, axis + half):
+                self.ax.plot([pose.x, pose.x + rmax * math.cos(edge)],
+                             [pose.y, pose.y + rmax * math.sin(edge)],
+                             ls=":", lw=1.0, color="k", alpha=0.55)
 
         people = self.bucket()
         for p in people:
@@ -683,6 +718,13 @@ def main():
     p.add_argument("--odom-topic", default=None)
     p.add_argument("--range", type=float, default=None,
                    help="Clip and frame the view at this many metres.")
+    p.add_argument("--camera-fov", type=float, default=None,
+                   help="Camera field of view in degrees. 0 hides the wedge.")
+    p.add_argument("--camera-yaw", type=float, default=None,
+                   help="Rotate the wedge off the robot marker, in degrees.")
+    p.add_argument("--robot-yaw", type=float, default=None,
+                   help="Rotate the robot marker off the odometry yaw, in "
+                        "degrees. The wedge follows it. 180 mirrors both.")
     p.add_argument("--max-images", type=int, default=4000,
                    help="Cap on frames held in memory.")
     args = p.parse_args()
@@ -692,8 +734,16 @@ def main():
               max_images=args.max_images)
     if args.range:
         bag.range_max = args.range
-    print("{} scans of {} beams, {} camera frames, odometry: {}".format(
-        len(bag.scan_t), bag.ranges.shape[1], len(bag.img_t),
+    if args.camera_fov is not None:
+        globals()["CAMERA_FOV_DEG"] = args.camera_fov or None
+    if args.camera_yaw is not None:
+        globals()["CAMERA_YAW_DEG"] = args.camera_yaw
+    if args.robot_yaw is not None:
+        globals()["ROBOT_YAW_DEG"] = args.robot_yaw
+    lo, hi = bag.beam_counts
+    beams = "{} beams".format(lo) if lo == hi else "{}-{} beams".format(lo, hi)
+    print("{} scans of {}, {} camera frames, odometry: {}".format(
+        len(bag.scan_t), beams, len(bag.img_t),
         "yes" if bag.poses is not None else "no"))
     if bag.poses is None:
         print("No odometry topic, so only the sensor view is available.")
